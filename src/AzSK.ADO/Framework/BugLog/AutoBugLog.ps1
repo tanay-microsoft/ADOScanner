@@ -5,6 +5,8 @@ class AutoBugLog {
     hidden [InvocationInfo] $InvocationContext;
     hidden [PSObject] $ControlSettings; 
     hidden [SVTEventContext[]] $ControlResults;
+    hidden [bool] $isBugLogCustomFlow = $false;
+    hidden [bool] $isBindS360Perperties = $false;
     
     
     AutoBugLog([SubscriptionContext] $subscriptionContext, [InvocationInfo] $invocationContext, [SVTEventContext[]] $ControlResults, [ControlStateExtension] $ControlStateExt) {
@@ -12,7 +14,12 @@ class AutoBugLog {
         $this.InvocationContext = $invocationContext;	
         $this.ControlResults = $ControlResults;		
         $this.ControlSettings = [ConfigurationManager]::LoadServerConfigFile("ControlSettings.json");
-        $this.ControlStateExt = $ControlStateExt               
+        $this.ControlStateExt = $ControlStateExt      
+        
+        #flag to check if pluggable bug logging interface (service tree)
+        if ([Helpers]::CheckMember($this.ControlSettings.BugLogging, "BugAssigneeAndPathCustomFlow", $null)) {
+            $this.isBugLogCustomFlow = $this.ControlSettings.BugLogging.BugAssigneeAndPathCustomFlow;
+        }
     }  
 
     static [string] ComputeHashX([string] $dataToHash)
@@ -27,19 +34,25 @@ class AutoBugLog {
             #retrieve the project name for the current resource
             $ProjectName = $this.GetProjectForBugLog($ControlResults[0])
 
-            #check if the area and iteration path are valid
-            #flag to check if pluggable bug logging interface (service tree)
-            $isBugLogCustomFlow = $false;
-            if ([Helpers]::CheckMember($this.ControlSettings.BugLogging, "BugAssigneeAndPathCustomFlow", $null)) {
-                $isBugLogCustomFlow = $this.ControlSettings.BugLogging.BugAssigneeAndPathCustomFlow;
-            } 
-            if ([BugLogPathManager]::CheckIfPathIsValid($this.SubscriptionContext.SubscriptionName,$ProjectName,$this.InvocationContext,  $this.ControlSettings.BugLogging.BugLogAreaPath, $this.ControlSettings.BugLogging.BugLogIterationPath, $isBugLogCustomFlow)) {
+            #check if the area and iteration path are valid 
+            if ([BugLogPathManager]::CheckIfPathIsValid($this.SubscriptionContext.SubscriptionName,$ProjectName,$this.InvocationContext,  $this.ControlSettings.BugLogging.BugLogAreaPath, $this.ControlSettings.BugLogging.BugLogIterationPath, $this.isBugLogCustomFlow)) {
                 #Obtain the assignee for the current resource, will be same for all the control failures for this particular resource
-                $AssignedTo = $this.GetAssignee($ControlResults[0])
+                $metaProviderObj = [BugMetaInfoProvider]::new();        
+                $AssignedTo = $metaProviderObj.GetAssignee($ControlResults[0], $this.ControlSettings.BugLogging)
+                $serviceId = $metaProviderObj.ServiceId
+
+                if ($this.isBugLogCustomFlow  -and (-not [string]::IsNullOrEmpty($serviceId)) -and ([Helpers]::CheckMember($this.ControlSettings.BugLogging, "BugLoggingS360") -and $this.ControlSettings.BugLogging.BugLoggingS360) ) {
+                    $this.isBindS360Perperties = $true;
+                }
+                else {
+                    $this.isBindS360Perperties = $false;
+                }
+
                 #Obtain area and iteration paths
                 $AreaPath = [BugLogPathManager]::GetAreaPath()
                 $IterationPath = [BugLogPathManager]::GetIterationPath()       
-	
+                $BugLoggingProject = [BugLogPathManager]::GetBugLoggingProject() #This project should be used to check if current bug exists or not
+
                 #this falg is added to restrict 'Determining bug logging' message should print only once 
                 $printLogBugMsg = $true;
                 #Loop through all the control results for the current resource
@@ -65,7 +78,7 @@ class AutoBugLog {
                         #compute hash of control Id and resource Id	
                         $hash = $this.GetHashedTag($control.ControlItem.Id, $control.ResourceContext.ResourceId)
                         #check if a bug with the computed hash exists
-                        $workItem = $this.GetWorkItemByHash($hash, $ProjectName)
+                        $workItem = $this.GetWorkItemByHash($hash, $BugLoggingProject)
                         if ($workItem[0].results.count -gt 0) {
                             #a work item with the hash exists, find if it's state and reactivate if resolved bug
                             $this.ManageActiveAndResolvedBugs($ProjectName, $control, $workItem, $AssignedTo)
@@ -108,7 +121,7 @@ class AutoBugLog {
                             $Severity = $this.GetSeverity($control.ControlItem.ControlSeverity)		
                     
                             #function to attempt bug logging
-                            $this.AddWorkItem($Title, $Description, $AssignedTo, $AreaPath, $IterationPath, $Severity, $ProjectName, $control, $hash)
+                            $this.AddWorkItem($Title, $Description, $AssignedTo, $AreaPath, $IterationPath, $Severity, $ProjectName, $control, $hash, $serviceId)
                     
                         }
                     }
@@ -289,6 +302,27 @@ class AutoBugLog {
 
         return $Severity
     }
+
+    hidden [string] GetSecuritySeverity([string] $ControlSeverity) {
+        $Severity = ""
+        switch -regex ($ControlSeverity) {
+            'Critical' {
+                $Severity = "1 - Critical"
+            }
+            'High' {
+                $Severity = "2 - Important"
+            }
+            'Medium' {
+                $Severity = "3 - Moderate"
+            }
+            'Low' {
+                $Severity = "4 - Low"
+            }
+
+        }
+
+        return $Severity
+    }
     
     #function to find active bugs and reactivate resolved bugs
     hidden [void] ManageActiveAndResolvedBugs([string]$ProjectName, [SVTEventContext[]] $control, [object] $workItem, [string] $AssignedTo) {
@@ -421,18 +455,34 @@ class AutoBugLog {
         return $hashedTag
     }
 
-    hidden [void] AddWorkItem([string] $Title, [string] $Description, [string] $AssignedTo, [string] $AreaPath, [string] $IterationPath, [string]$Severity, [string]$ProjectName, [SVTEventContext[]] $control, [string] $hash) {
+    hidden [void] AddWorkItem([string] $Title, [string] $Description, [string] $AssignedTo, [string] $AreaPath, [string] $IterationPath, [string]$Severity, [string]$ProjectName, [SVTEventContext[]] $control, [string] $hash, [string] $serviceId) {
 		
 		
         #logging new bugs
 		
         $apiurl = 'https://dev.azure.com/{0}/{1}/_apis/wit/workitems/$bug?api-version=5.1' -f $($this.SubscriptionContext.SubscriptionName), $ProjectName;
 
+        $BugTemplate = $null;
+        $SecuritySeverity = "";
         
+        if ($this.isBindS360Perperties) {
+            $BugTemplate = [ConfigurationManager]::LoadServerConfigFile("TemplateForNewBugS360.json")
+            $SecuritySeverity = $this.GetSecuritySeverity($control.ControlItem.ControlSeverity)		
+            $BugTemplate = $BugTemplate | ConvertTo-Json -Depth 10 
+        }
+        else {
+            $BugTemplate = [ConfigurationManager]::LoadServerConfigFile("TemplateForNewBug.json")
+        }
 
-        $BugTemplate = [ConfigurationManager]::LoadServerConfigFile("TemplateForNewBug.json")
+        # Replace the field reference name for bug description if it is customized
+        if ([Helpers]::CheckMember($this.controlsettings.BugLogging, 'BugDescriptionField') -and -not ([string]::IsNullOrEmpty($this.ControlSettings.BugLogging.BugDescriptionField))) {
+            $BugTemplate[1].path = "/fields/"+$this.ControlSettings.BugLogging.BugDescriptionField
+        }
+
+        if ($this.InvocationContext.BoundParameters['BugDescriptionField']) {
+            $BugTemplate[1].path = "/fields/"+$this.InvocationContext.BoundParameters['BugDescriptionField']
+        }
         $BugTemplate = $BugTemplate | ConvertTo-Json -Depth 10 
-
         $BugTemplate=$BugTemplate.Replace("{0}",$Title)
         $BugTemplate=$BugTemplate.Replace("{1}",$Description)
         $BugTemplate=$BugTemplate.Replace("{2}",$Severity)
@@ -440,6 +490,20 @@ class AutoBugLog {
         $BugTemplate=$BugTemplate.Replace("{4}",$IterationPath)
         $BugTemplate=$BugTemplate.Replace("{5}",$hash)
         $BugTemplate=$BugTemplate.Replace("{6}",$AssignedTo)
+
+        if ($this.isBindS360Perperties) 
+        {
+            #HowFound
+            $BugTemplate=$BugTemplate.Replace("{7}", $this.controlsettings.BugLogging.HowFound)
+            #ComplianceArea
+            $BugTemplate=$BugTemplate.Replace("{8}", $this.controlsettings.BugLogging.ComplianceArea)
+            #ServiceHierarchyId
+            $BugTemplate=$BugTemplate.Replace("{9}", $serviceId)
+            #ServiceHierarchyIdType
+            $BugTemplate=$BugTemplate.Replace("{10}", $this.controlsettings.BugLogging.ServiceHierarchyIdType)
+            #Severity
+            $BugTemplate=$BugTemplate.Replace("{11}", $SecuritySeverity)
+        }
 
         $responseObj = $null
         $header = [WebRequestHelper]::GetAuthHeaderFromUriPatch($apiurl)
@@ -479,6 +543,11 @@ class AutoBugLog {
         }
 		
 		
+    }
+
+    hidden [string] BindTemplate()
+    {
+
     }
 
     #the next two functions to check baseline and preview baseline, are duplicate controls that are present in ADOSVTBase as well.
