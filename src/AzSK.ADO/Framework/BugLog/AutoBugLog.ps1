@@ -545,11 +545,6 @@ class AutoBugLog {
 		
     }
 
-    hidden [string] BindTemplate()
-    {
-
-    }
-
     #the next two functions to check baseline and preview baseline, are duplicate controls that are present in ADOSVTBase as well.
     #they have been added again, due to behaviour of framework, where the file that needs to called in a certain file has to be mentioned
     #above the other file as it is dumped in the memory before the second file. This behaviour will effectively create a deadlock
